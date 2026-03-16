@@ -425,7 +425,30 @@ DURATION_OPTIONS = [
     discord.SelectOption(label="1 hour", value="60"),
     discord.SelectOption(label="2 hours", value="120"),
     discord.SelectOption(label="4 hours", value="240"),
+    discord.SelectOption(label="Custom...", value="custom", description="Enter your own duration"),
 ]
+
+
+class CustomDurationModal(discord.ui.Modal, title="Custom Duration"):
+    """Modal that asks for a custom number of minutes."""
+    minutes_input = discord.ui.TextInput(
+        label="Duration in minutes",
+        placeholder="e.g. 45",
+        min_length=1,
+        max_length=4,
+        required=True,
+    )
+
+    def __init__(self, callback_coro) -> None:
+        super().__init__()
+        self._callback_coro = callback_coro
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.minutes_input.value.strip()
+        if not raw.isdigit() or int(raw) < 1:
+            await interaction.response.send_message("Please enter a valid number of minutes (1+).", ephemeral=True)
+            return
+        await self._callback_coro(interaction, int(raw))
 
 
 async def _enrich_servers(servers: list[dict[str, Any]]) -> None:
@@ -468,6 +491,27 @@ class DurationSelect(discord.ui.View):
     async def duration_callback(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
+            return
+
+        if select.values[0] == "custom":
+            async def _run_custom(modal_interaction: discord.Interaction, minutes: int) -> None:
+                await modal_interaction.response.defer(ephemeral=True)
+                await modal_interaction.edit_original_response(
+                    content=f"\u23f3 Starting Azure VM for **{minutes} minutes**...",
+                    view=None,
+                )
+                compute_client.virtual_machines.begin_start(
+                    AZURE_RESOURCE_GROUP, AZURE_VM_NAME
+                ).result()
+                _start_session(minutes, self.channel_id, self.user_id)
+                hours, mins = divmod(minutes, 60)
+                time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+                await modal_interaction.edit_original_response(
+                    content=f"\u2705 Azure VM started! Session length: **{time_str}**. "
+                    "You will be warned 5 minutes before auto-shutdown.",
+                    view=None,
+                )
+            await interaction.response.send_modal(CustomDurationModal(_run_custom))
             return
 
         duration = int(select.values[0])
@@ -516,6 +560,20 @@ class ServerStartDurationView(discord.ui.View):
             await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
             return
 
+        if select.values[0] == "custom":
+            async def _run_custom(modal_interaction: discord.Interaction, minutes: int) -> None:
+                await modal_interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title=f"\u23f3  Starting Azure VM...",
+                        description="Booting the underlying VM. This may take a minute.",
+                        color=discord.Color.gold(),
+                    ),
+                    view=None,
+                )
+                await self._do_start(modal_interaction, minutes)
+            await interaction.response.send_modal(CustomDurationModal(_run_custom))
+            return
+
         duration = int(select.values[0])
         hours, mins = divmod(duration, 60)
         time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
@@ -529,6 +587,12 @@ class ServerStartDurationView(discord.ui.View):
             ),
             view=None,
         )
+        await self._do_start(interaction, duration)
+
+    async def _do_start(self, interaction: discord.Interaction, duration: int) -> None:
+        hours, mins = divmod(duration, 60)
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+
         compute_client.virtual_machines.begin_start(
             AZURE_RESOURCE_GROUP, AZURE_VM_NAME
         ).result()
@@ -640,6 +704,20 @@ class QuickStartDurationView(discord.ui.View):
             await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
             return
 
+        if select.values[0] == "custom":
+            async def _run_custom(modal_interaction: discord.Interaction, minutes: int) -> None:
+                await modal_interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title=f"\u23f3  Starting {self.server_name}...",
+                        description="Sending start signal to the game server.",
+                        color=discord.Color.gold(),
+                    ),
+                    view=None,
+                )
+                await self._do_start(modal_interaction, minutes)
+            await interaction.response.send_modal(CustomDurationModal(_run_custom))
+            return
+
         duration = int(select.values[0])
         hours, mins = divmod(duration, 60)
         time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
@@ -652,6 +730,11 @@ class QuickStartDurationView(discord.ui.View):
             ),
             view=None,
         )
+        await self._do_start(interaction, duration)
+
+    async def _do_start(self, interaction: discord.Interaction, duration: int) -> None:
+        hours, mins = divmod(duration, 60)
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
 
         # Reset timer
         _start_session(duration, self.channel_id, self.user_id,
