@@ -15,6 +15,7 @@ def _require_env(name: str) -> str:
 
 # Discord
 DISCORD_BOT_TOKEN = _require_env("DISCORD_BOT_TOKEN")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # Optional: for instant slash command sync
 
 # Azure
 AZURE_TENANT_ID = _require_env("AZURE_TENANT_ID")

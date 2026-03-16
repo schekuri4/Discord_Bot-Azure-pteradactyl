@@ -12,6 +12,7 @@ from azure.mgmt.compute import ComputeManagementClient
 from api.pterodactyl import PterodactylClient, PterodactylAdmin
 from config import (
     DISCORD_BOT_TOKEN,
+    DISCORD_GUILD_ID,
     AZURE_TENANT_ID,
     AZURE_CLIENT_ID,
     AZURE_CLIENT_SECRET,
@@ -60,8 +61,14 @@ class MCBot(commands.Bot):
     async def setup_hook(self) -> None:
         for cog in COGS:
             await self.load_extension(cog)
-        await self.tree.sync()
-        print(f"Loaded {len(COGS)} cogs and synced slash commands.")
+        if DISCORD_GUILD_ID:
+            guild = discord.Object(id=int(DISCORD_GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"Loaded {len(COGS)} cogs and synced slash commands to guild {DISCORD_GUILD_ID}.")
+        else:
+            await self.tree.sync()
+            print(f"Loaded {len(COGS)} cogs and synced slash commands globally.")
 
     async def on_ready(self) -> None:
         print(f"Logged in as {self.user} and ready.")
