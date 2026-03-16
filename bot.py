@@ -74,7 +74,7 @@ class PterodactylApi:
         # Client API lists servers with allocation (IP/port) and status info.
         url = f"{self.panel_url}/api/client?per_page=100"
         servers: list[dict[str, Any]] = []
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=5)
 
         async with aiohttp.ClientSession() as session:
             while url:
@@ -131,7 +131,7 @@ class PterodactylApi:
 
     async def get_server_resources(self, identifier: str) -> dict[str, Any]:
         url = f"{self.panel_url}/api/client/servers/{identifier}/resources"
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=5)
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=self._headers(), timeout=timeout) as response:
@@ -162,7 +162,7 @@ class PterodactylApi:
     async def send_command(self, identifier: str, command: str) -> None:
         url = f"{self.panel_url}/api/client/servers/{identifier}/command"
         payload = {"command": command}
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=10)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=self._headers(), json=payload, timeout=timeout) as response:
