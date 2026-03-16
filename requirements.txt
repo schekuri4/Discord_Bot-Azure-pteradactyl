@@ -1,0 +1,4 @@
+discord.py==2.5.2
+azure-identity==1.25.0
+azure-mgmt-compute==37.0.1
+python-dotenv==1.1.1
