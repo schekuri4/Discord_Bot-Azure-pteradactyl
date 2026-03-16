@@ -948,6 +948,7 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
         self.signal = signal
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        global active_session
         if not _is_authorized(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
