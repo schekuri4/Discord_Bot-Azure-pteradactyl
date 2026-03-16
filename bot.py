@@ -290,6 +290,7 @@ async def _session_timer(duration_minutes: int, channel_id: int, user_id: int) -
 
 async def _create_console_channel(
     guild: discord.Guild, server_name: str, server_identifier: str,
+    user: discord.Member | discord.User | None = None,
 ) -> discord.TextChannel | None:
     """Create an admin-only text channel for server console I/O."""
     # Sanitize name for Discord channel (lowercase, hyphens, max 100)
@@ -303,6 +304,9 @@ async def _create_console_channel(
     for role in guild.roles:
         if role.permissions.administrator:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    # Also grant access to the user who started the session (server owner may not have an admin role)
+    if user and isinstance(user, discord.Member):
+        overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
     channel = await guild.create_text_channel(
         name=channel_name,
@@ -556,9 +560,10 @@ class ServerStartDurationView(discord.ui.View):
             try:
                 console_ch = await _create_console_channel(
                     interaction.guild, self.server_name, self.server_identifier,
+                    user=interaction.user,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"Failed to create console channel: {exc}")
 
         # Update session with console channel + server info
         if active_session:
@@ -643,9 +648,10 @@ class QuickStartDurationView(discord.ui.View):
             try:
                 console_ch = await _create_console_channel(
                     interaction.guild, self.server_name, self.server_identifier,
+                    user=interaction.user,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"Failed to create console channel: {exc}")
 
         if active_session:
             active_session["server_identifier"] = self.server_identifier
