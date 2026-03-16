@@ -18,12 +18,12 @@ python bot.py
 
 ## Commands
 
-| Command          | Description                                              |
-| ---------------- | -------------------------------------------------------- |
-| `/startserver`   | Start Azure VM                                           |
-| `/stopserver`    | Stop Azure VM                                            |
-| `/statusserver`  | Check Azure VM status                                    |
-| `/mc`            | Server panel — dropdown to pick a server, start/stop/refresh buttons |
+| Command         | Description                                                          |
+| --------------- | -------------------------------------------------------------------- |
+| `/startserver`  | Start Azure VM                                                       |
+| `/stopserver`   | Stop Azure VM                                                        |
+| `/statusserver` | Check Azure VM status                                                |
+| `/mc`           | Server panel — dropdown to pick a server, start/stop/refresh buttons |
 
 ## Environment Variables
 
