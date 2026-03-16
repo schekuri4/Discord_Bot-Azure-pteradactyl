@@ -430,7 +430,7 @@ DURATION_OPTIONS = [
 class DurationSelect(discord.ui.View):
     """Shown when user starts the VM via /startserver."""
     def __init__(self, user_id: int, channel_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.user_id = user_id
         self.channel_id = channel_id
 
@@ -470,12 +470,15 @@ class DurationSelect(discord.ui.View):
 class ServerStartDurationView(discord.ui.View):
     """Duration picker shown when starting a game server from /mc.
     Starts Azure VM → waits for panel → starts the Pterodactyl server."""
-    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str) -> None:
-        super().__init__(timeout=60)
+    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str,
+                 server: dict[str, Any] | None = None, all_servers: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(timeout=120)
         self.user_id = user_id
         self.channel_id = channel_id
         self.server_identifier = server_identifier
         self.server_name = server_name
+        self.server = server or {"name": server_name, "identifier": server_identifier}
+        self.all_servers = all_servers or []
 
     @discord.ui.select(
         cls=discord.ui.Select,
@@ -517,6 +520,9 @@ class ServerStartDurationView(discord.ui.View):
         )
         panel_up = await _wait_for_panel()
         if not panel_up:
+            nav = discord.ui.View(timeout=900)
+            if self.all_servers:
+                nav.add_item(BackButton(self.all_servers))
             await interaction.edit_original_response(
                 embed=discord.Embed(
                     title="\u26a0\ufe0f  Panel did not respond",
@@ -524,6 +530,7 @@ class ServerStartDurationView(discord.ui.View):
                     "Try `/mc` again in a moment.",
                     color=discord.Color.orange(),
                 ),
+                view=nav if self.all_servers else None,
             )
             return
 
@@ -538,12 +545,16 @@ class ServerStartDurationView(discord.ui.View):
         try:
             await _ptero_client().send_power_signal(self.server_identifier, "start")
         except Exception as exc:
+            nav = discord.ui.View(timeout=900)
+            if self.all_servers:
+                nav.add_item(BackButton(self.all_servers))
             await interaction.edit_original_response(
                 embed=discord.Embed(
                     title="\u274c  Could not start game server",
                     description=str(exc),
                     color=discord.Color.red(),
                 ),
+                view=nav if self.all_servers else None,
             )
             return
 
@@ -572,27 +583,26 @@ class ServerStartDurationView(discord.ui.View):
             if console_ch:
                 active_session["console_channel_id"] = console_ch.id
 
-        console_note = ""
+        embed = _server_embed(self.server, state)
         if console_ch:
-            console_note = f"\n\n\U0001f5a5\ufe0f Console channel: {console_ch.mention}"
+            embed.add_field(name="\U0001f5a5\ufe0f Console", value=console_ch.mention, inline=False)
+        embed.set_footer(text=f"Session: {time_str} \u2022 Auto-shutdown enabled")
 
-        await interaction.edit_original_response(
-            embed=discord.Embed(
-                title=f"\u2705  {self.server_name} — {state}",
-                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.{console_note}",
-                color=STATUS_COLORS.get(state, discord.Color.green()),
-            ),
-        )
+        action_view = ServerActionView(self.server, state, self.all_servers)
+        await interaction.edit_original_response(embed=embed, view=action_view)
 
 
 class QuickStartDurationView(discord.ui.View):
     """Duration picker when VM is already running. Starts game server and resets timer."""
-    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str) -> None:
-        super().__init__(timeout=60)
+    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str,
+                 server: dict[str, Any] | None = None, all_servers: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(timeout=120)
         self.user_id = user_id
         self.channel_id = channel_id
         self.server_identifier = server_identifier
         self.server_name = server_name
+        self.server = server or {"name": server_name, "identifier": server_identifier}
+        self.all_servers = all_servers or []
 
     @discord.ui.select(
         cls=discord.ui.Select,
@@ -626,12 +636,16 @@ class QuickStartDurationView(discord.ui.View):
         try:
             await _ptero_client().send_power_signal(self.server_identifier, "start")
         except Exception as exc:
+            nav = discord.ui.View(timeout=900)
+            if self.all_servers:
+                nav.add_item(BackButton(self.all_servers))
             await interaction.edit_original_response(
                 embed=discord.Embed(
                     title="\u274c  Could not start game server",
                     description=str(exc),
                     color=discord.Color.red(),
                 ),
+                view=nav if self.all_servers else None,
             )
             return
 
@@ -659,17 +673,13 @@ class QuickStartDurationView(discord.ui.View):
             if console_ch:
                 active_session["console_channel_id"] = console_ch.id
 
-        console_note = ""
+        embed = _server_embed(self.server, state)
         if console_ch:
-            console_note = f"\n\n\U0001f5a5\ufe0f Console channel: {console_ch.mention}"
+            embed.add_field(name="\U0001f5a5\ufe0f Console", value=console_ch.mention, inline=False)
+        embed.set_footer(text=f"Session: {time_str} \u2022 Auto-shutdown enabled")
 
-        await interaction.edit_original_response(
-            embed=discord.Embed(
-                title=f"\u2705  {self.server_name} \u2014 {state}",
-                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.{console_note}",
-                color=STATUS_COLORS.get(state, discord.Color.green()),
-            ),
-        )
+        action_view = ServerActionView(self.server, state, self.all_servers)
+        await interaction.edit_original_response(embed=embed, view=action_view)
 
 
 @tree.command(name="statusserver", description="Show Azure VM power status")
@@ -754,13 +764,14 @@ def _server_embed(server: dict[str, Any], state: str) -> discord.Embed:
     elif server.get("ip"):
         address = f"`{server['ip']}`"
 
-    embed.add_field(name="Status", value=f"`{state}`", inline=True)
+    embed.add_field(name="Status", value=f"{emoji} `{state}`", inline=True)
     if address:
         embed.add_field(name="Address", value=address, inline=True)
     embed.add_field(name="ID", value=f"`{server['identifier']}`", inline=True)
     if server.get("node"):
         embed.add_field(name="Node", value=server["node"], inline=True)
 
+    embed.timestamp = discord.utils.utcnow()
     return embed
 
 
@@ -804,7 +815,7 @@ class ServerSelect(discord.ui.Select["McView"]):
 
 class ServerActionView(discord.ui.View):
     def __init__(self, server: dict[str, Any], state: str, all_servers: list[dict[str, Any]] | None = None) -> None:
-        super().__init__(timeout=120)
+        super().__init__(timeout=900)
         self.server = server
         self.identifier = server["identifier"]
         self.all_servers = all_servers or []
@@ -837,6 +848,7 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
 
         # Always show duration picker when starting a server
         if self.signal == "start":
+            all_servers = self.view.all_servers if self.view else []
             if active_session:
                 # VM already running — just pick duration, start server, reset timer
                 view = QuickStartDurationView(
@@ -844,6 +856,8 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
                     interaction.channel_id or 0,
                     self.identifier,
                     server.get("name", "server"),
+                    server=server,
+                    all_servers=all_servers,
                 )
                 await interaction.response.edit_message(
                     embed=discord.Embed(
@@ -860,6 +874,8 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
                     interaction.channel_id or 0,
                     self.identifier,
                     server.get("name", "server"),
+                    server=server,
+                    all_servers=all_servers,
                 )
                 await interaction.response.edit_message(
                     embed=discord.Embed(
@@ -891,7 +907,11 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
                     f"**Reason:** {exc or 'Panel may be unreachable. Is the Azure VM running?'}",
                 color=discord.Color.red(),
             )
-            await interaction.edit_original_response(embed=error_embed, view=None)
+            all_servers = self.view.all_servers if self.view else []
+            nav = discord.ui.View(timeout=900)
+            if all_servers:
+                nav.add_item(BackButton(all_servers))
+            await interaction.edit_original_response(embed=error_embed, view=nav if all_servers else None)
             return
 
         # Brief pause then refresh status
@@ -947,7 +967,7 @@ class BackButton(discord.ui.Button["ServerActionView"]):
 
 class McView(discord.ui.View):
     def __init__(self, servers: list[dict[str, Any]]) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=900)
         self.add_item(ServerSelect(servers))
 
 
@@ -975,6 +995,7 @@ def _mc_list_embed(servers: list[dict[str, Any]], from_cache: bool = False) -> d
         lines.append(f"`{i}.` **{s['name']}** \u2014 `{address}`")
     embed.add_field(name="Servers", value="\n".join(lines), inline=False)
 
+    embed.timestamp = discord.utils.utcnow()
     return embed
 
 
