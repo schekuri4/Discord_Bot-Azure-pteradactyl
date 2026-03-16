@@ -510,33 +510,42 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        server = self.view.server if self.view else {}
+        signal_labels = {"start": "Starting", "stop": "Stopping", "restart": "Restarting", "kill": "Killing"}
+        action_label = signal_labels.get(self.signal, self.signal.title())
+
+        # Immediately show feedback
+        pending_embed = discord.Embed(
+            title=f"\u23f3  {action_label} {server.get('name', 'server')}...",
+            description="Please wait, this may take a moment.",
+            color=discord.Color.gold(),
+        )
+        await interaction.response.edit_message(embed=pending_embed, view=None)
 
         try:
             await _ptero_client().send_power_signal(self.identifier, self.signal)
         except Exception as exc:
-            await interaction.edit_original_response(
-                content=f"Failed to send `{self.signal}`: {exc}",
-                embed=None,
-                view=None,
+            error_embed = discord.Embed(
+                title="\u274c  Action Failed",
+                description=f"Could not send `{self.signal}`.\n\n"
+                    f"**Reason:** {exc or 'Panel may be unreachable. Is the Azure VM running?'}",
+                color=discord.Color.red(),
             )
+            await interaction.edit_original_response(embed=error_embed, view=None)
             return
 
-        # Refresh status after action
+        # Brief pause then refresh status
+        await asyncio.sleep(2)
+
         try:
             resources = await _ptero_client().get_server_resources(self.identifier)
         except Exception:
             resources = {}
 
         state = str(resources.get("current_state", "unknown"))
-        server = self.view.server if self.view else {}
         embed = _server_embed(server, state)
         new_view = ServerActionView(server, state)
-        await interaction.edit_original_response(
-            content=f"`{self.signal}` signal sent.",
-            embed=embed,
-            view=new_view,
-        )
+        await interaction.edit_original_response(embed=embed, view=new_view)
 
 
 class RefreshButton(discord.ui.Button["ServerActionView"]):
@@ -594,13 +603,12 @@ async def mc(interaction: discord.Interaction) -> None:
         description=desc,
         color=discord.Color.dark_green(),
     )
-    for s in servers[:10]:
-        address = f"`{s['ip']}:{s['port']}`" if s.get("ip") and s.get("port") else "N/A"
-        embed.add_field(
-            name=s["name"],
-            value=f"ID: `{s['identifier']}`\nAddress: {address}",
-            inline=True,
-        )
+    # Clean list format
+    lines: list[str] = []
+    for i, s in enumerate(servers[:10], 1):
+        address = f"{s['ip']}:{s['port']}" if s.get("ip") and s.get("port") else "—"
+        lines.append(f"`{i}.` **{s['name']}** — `{address}`")
+    embed.add_field(name="Servers", value="\n".join(lines), inline=False)
 
     view = McView(servers)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
