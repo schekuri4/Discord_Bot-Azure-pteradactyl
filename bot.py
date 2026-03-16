@@ -59,10 +59,10 @@ class PterodactylApi:
             "Content-Type": "application/json",
         }
 
-    async def list_servers(self) -> list[dict[str, str]]:
-        # Client API lists servers the authenticated user has access to.
+    async def list_servers(self) -> list[dict[str, Any]]:
+        # Client API lists servers with allocation (IP/port) and status info.
         url = f"{self.panel_url}/api/client?per_page=100"
-        servers: list[dict[str, str]] = []
+        servers: list[dict[str, Any]] = []
         timeout = aiohttp.ClientTimeout(total=30)
 
         async with aiohttp.ClientSession() as session:
@@ -80,12 +80,31 @@ class PterodactylApi:
                         name = str(attrs.get("name", "unknown"))
                         identifier = str(attrs.get("identifier", ""))
                         uuid = str(attrs.get("uuid", ""))
+                        description = str(attrs.get("description", "") or "")
+                        node = str(attrs.get("node", ""))
+                        is_suspended = bool(attrs.get("is_suspended", False))
+
+                        # Allocation info (IP + port)
+                        relationships = attrs.get("relationships", {})
+                        allocs = relationships.get("allocations", {}).get("data", [])
+                        ip = ""
+                        port = ""
+                        if allocs:
+                            alloc_attrs = allocs[0].get("attributes", {})
+                            ip = str(alloc_attrs.get("ip_alias") or alloc_attrs.get("ip", ""))
+                            port = str(alloc_attrs.get("port", ""))
+
                         if identifier:
                             servers.append(
                                 {
                                     "name": name,
                                     "identifier": identifier,
                                     "uuid": uuid,
+                                    "description": description,
+                                    "node": node,
+                                    "ip": ip,
+                                    "port": port,
+                                    "suspended": is_suspended,
                                 }
                             )
 
@@ -99,10 +118,20 @@ class PterodactylApi:
 
         return servers
 
-    async def start_server(self, identifier: str) -> None:
-        # Client power endpoint uses server identifier and can start the server instance.
+    async def get_server_resources(self, identifier: str) -> dict[str, Any]:
+        url = f"{self.panel_url}/api/client/servers/{identifier}/resources"
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=self._headers(), timeout=timeout) as response:
+                if response.status >= 400:
+                    return {"current_state": "unknown"}
+                payload = await response.json()
+                return payload.get("attributes", {})
+
+    async def send_power_signal(self, identifier: str, signal: str) -> None:
         url = f"{self.panel_url}/api/client/servers/{identifier}/power"
-        payload = {"signal": "start"}
+        payload = {"signal": signal}
         timeout = aiohttp.ClientTimeout(total=30)
 
         async with aiohttp.ClientSession() as session:
@@ -113,11 +142,10 @@ class PterodactylApi:
                 body = await response.text()
                 if response.status in (401, 403):
                     raise PterodactylApiError(
-                        "Pterodactyl rejected power control. Use a client API key (prefix ptlc_)"
-                        " for /api/client endpoints, or adjust panel API permissions."
+                        "Pterodactyl rejected power control. Check API key permissions."
                     )
                 raise PterodactylApiError(
-                    f"Pterodactyl start failed ({response.status}): {body[:300]}"
+                    f"Pterodactyl power signal failed ({response.status}): {body[:300]}"
                 )
 
 
@@ -198,8 +226,173 @@ async def stopserver(interaction: discord.Interaction) -> None:
     await interaction.followup.send(f"Stopped `{AZURE_VM_NAME}` (deallocated). Current status: `{state}`")
 
 
-@tree.command(name="mcservers", description="List servers from your Pterodactyl panel")
-async def mcservers(interaction: discord.Interaction) -> None:
+STATUS_COLORS = {
+    "running": discord.Color.green(),
+    "starting": discord.Color.gold(),
+    "stopping": discord.Color.orange(),
+    "offline": discord.Color.red(),
+    "unknown": discord.Color.greyple(),
+}
+
+STATUS_EMOJI = {
+    "running": "\U0001f7e2",   # green circle
+    "starting": "\U0001f7e1",  # yellow circle
+    "stopping": "\U0001f7e0",  # orange circle
+    "offline": "\U0001f534",   # red circle
+}
+
+
+def _server_embed(server: dict[str, Any], state: str) -> discord.Embed:
+    color = STATUS_COLORS.get(state, STATUS_COLORS["unknown"])
+    emoji = STATUS_EMOJI.get(state, "\u2753")
+    embed = discord.Embed(
+        title=f"{emoji}  {server['name']}",
+        color=color,
+    )
+    if server.get("description"):
+        embed.description = server["description"]
+
+    address = ""
+    if server.get("ip") and server.get("port"):
+        address = f"`{server['ip']}:{server['port']}`"
+    elif server.get("ip"):
+        address = f"`{server['ip']}`"
+
+    embed.add_field(name="Status", value=f"`{state}`", inline=True)
+    if address:
+        embed.add_field(name="Address", value=address, inline=True)
+    embed.add_field(name="ID", value=f"`{server['identifier']}`", inline=True)
+    if server.get("node"):
+        embed.add_field(name="Node", value=server["node"], inline=True)
+
+    return embed
+
+
+class ServerSelect(discord.ui.Select["McView"]):
+    def __init__(self, servers: list[dict[str, Any]]) -> None:
+        options = [
+            discord.SelectOption(
+                label=s["name"][:100],
+                value=s["identifier"],
+                description=f"ID: {s['identifier']}"[:100],
+            )
+            for s in servers[:25]
+        ]
+        super().__init__(placeholder="Select a server...", options=options, row=0)
+        self.servers = {s["identifier"]: s for s in servers}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        identifier = self.values[0]
+        server = self.servers.get(identifier)
+        if not server:
+            await interaction.response.send_message("Server not found.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            resources = await _ptero_client().get_server_resources(identifier)
+        except Exception:
+            resources = {}
+
+        state = str(resources.get("current_state", "unknown"))
+        embed = _server_embed(server, state)
+        view = ServerActionView(server, state)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+
+class ServerActionView(discord.ui.View):
+    def __init__(self, server: dict[str, Any], state: str) -> None:
+        super().__init__(timeout=120)
+        self.server = server
+        self.identifier = server["identifier"]
+
+        if state in ("offline", "unknown"):
+            self.add_item(PowerButton(self.identifier, "start", discord.ButtonStyle.green, "\u25B6 Start"))
+        if state == "running":
+            self.add_item(PowerButton(self.identifier, "restart", discord.ButtonStyle.blurple, "\U0001f504 Restart"))
+            self.add_item(PowerButton(self.identifier, "stop", discord.ButtonStyle.red, "\u23F9 Stop"))
+        if state in ("starting", "stopping"):
+            self.add_item(PowerButton(self.identifier, "kill", discord.ButtonStyle.danger, "\u26A0 Kill"))
+
+        self.add_item(RefreshButton(self.server))
+
+
+class PowerButton(discord.ui.Button["ServerActionView"]):
+    def __init__(self, identifier: str, signal: str, style: discord.ButtonStyle, label: str) -> None:
+        super().__init__(style=style, label=label, row=1)
+        self.identifier = identifier
+        self.signal = signal
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await _ptero_client().send_power_signal(self.identifier, self.signal)
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"Failed to send `{self.signal}`: {exc}",
+                embed=None,
+                view=None,
+            )
+            return
+
+        # Refresh status after action
+        try:
+            resources = await _ptero_client().get_server_resources(self.identifier)
+        except Exception:
+            resources = {}
+
+        state = str(resources.get("current_state", "unknown"))
+        server = self.view.server if self.view else {}
+        embed = _server_embed(server, state)
+        new_view = ServerActionView(server, state)
+        await interaction.edit_original_response(
+            content=f"`{self.signal}` signal sent.",
+            embed=embed,
+            view=new_view,
+        )
+
+
+class RefreshButton(discord.ui.Button["ServerActionView"]):
+    def __init__(self, server: dict[str, Any]) -> None:
+        super().__init__(style=discord.ButtonStyle.secondary, label="\U0001f504 Refresh", row=1)
+        self.server = server
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            resources = await _ptero_client().get_server_resources(self.server["identifier"])
+        except Exception:
+            resources = {}
+
+        state = str(resources.get("current_state", "unknown"))
+        embed = _server_embed(self.server, state)
+        new_view = ServerActionView(self.server, state)
+        await interaction.edit_original_response(embed=embed, view=new_view)
+
+
+class McView(discord.ui.View):
+    def __init__(self, servers: list[dict[str, Any]]) -> None:
+        super().__init__(timeout=180)
+        self.add_item(ServerSelect(servers))
+
+
+@tree.command(name="mc", description="Manage your Minecraft servers")
+async def mc(interaction: discord.Interaction) -> None:
     if not await _check_auth(interaction):
         return
 
@@ -208,73 +401,28 @@ async def mcservers(interaction: discord.Interaction) -> None:
     try:
         servers = await _ptero_client().list_servers()
     except Exception as exc:
-        await interaction.followup.send(f"Could not fetch Pterodactyl servers: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Could not fetch servers: {exc}", ephemeral=True)
         return
 
     if not servers:
-        await interaction.followup.send("No Pterodactyl servers found.", ephemeral=True)
+        await interaction.followup.send("No servers found on the panel.", ephemeral=True)
         return
 
-    lines = [
-        f"{index}. `{server['name']}` - `{server['identifier']}`"
-        for index, server in enumerate(servers[:25], start=1)
-    ]
-    await interaction.followup.send(
-        "Use `/startmcserver` and pick one from autocomplete.\n\n" + "\n".join(lines),
-        ephemeral=True,
+    embed = discord.Embed(
+        title="\U0001f3ae  Minecraft Server Panel",
+        description="Select a server from the dropdown below to view details and controls.",
+        color=discord.Color.dark_green(),
     )
-
-
-async def _ptero_server_autocomplete(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    if not _is_authorized(interaction):
-        return []
-
-    try:
-        servers = await _ptero_client().list_servers()
-    except Exception:
-        return []
-
-    query = current.lower().strip()
-    filtered: list[dict[str, str]] = []
-    for server in servers:
-        haystack = f"{server['name']} {server['identifier']} {server['uuid']}".lower()
-        if not query or query in haystack:
-            filtered.append(server)
-
-    return [
-        app_commands.Choice(
-            name=f"{server['name']} ({server['identifier']})"[:100],
-            value=server["identifier"],
+    for s in servers[:10]:
+        address = f"`{s['ip']}:{s['port']}`" if s.get("ip") and s.get("port") else "N/A"
+        embed.add_field(
+            name=s["name"],
+            value=f"ID: `{s['identifier']}`\nAddress: {address}",
+            inline=True,
         )
-        for server in filtered[:25]
-    ]
 
-
-@tree.command(name="startmcserver", description="Start a selected Pterodactyl server")
-@app_commands.describe(server_identifier="Choose a server identifier")
-@app_commands.autocomplete(server_identifier=_ptero_server_autocomplete)
-async def startmcserver(interaction: discord.Interaction, server_identifier: str) -> None:
-    if not await _check_auth(interaction):
-        return
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-
-    try:
-        await _ptero_client().start_server(server_identifier)
-    except Exception as exc:
-        await interaction.followup.send(
-            f"Could not start `{server_identifier}`: {exc}",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.followup.send(
-        f"Start signal sent for `{server_identifier}`.",
-        ephemeral=True,
-    )
+    view = McView(servers)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @client.event

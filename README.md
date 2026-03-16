@@ -1,62 +1,33 @@
-# Discord Azure + Pterodactyl Controller Bot
+# Discord Bot — Azure VM + Pterodactyl
 
-Python Discord bot with slash commands to control:
+Discord bot to start/stop an Azure VM and manage Pterodactyl game servers.
 
-- Azure VM: `/startserver`, `/stopserver`, `/statusserver`
-- Pterodactyl servers: `/mcservers`, `/startmcserver`
+## Setup
 
-## 1) Prerequisites
-
-- Python 3.10+
-- Azure VM
-- Azure App Registration with RBAC permission on the VM or resource group
-- Discord bot token
-
-## 2) Azure Permission Setup
-
-Assign the app registration to your VM scope (or resource group scope):
-
-- Role: `Virtual Machine Contributor`
-- Scope: VM or resource group that contains the VM
-
-## 3) Configure Environment
-
-1. Copy `.env.example` to `.env`
-2. Fill these values:
-   - `DISCORD_BOT_TOKEN`
-   - `AZURE_CLIENT_SECRET`
-   - `AZURE_SUBSCRIPTION_ID`
-   - `AZURE_RESOURCE_GROUP`
-   - `AZURE_VM_NAME`
-   - `PTERODACTYL_PANEL_URL`
-   - `PTERODACTYL_API_KEY`
-
-`AZURE_TENANT_ID` and `AZURE_CLIENT_ID` are prefilled from your provided app registration.
-
-For Pterodactyl:
-
-- `PTERODACTYL_PANEL_URL` example: `https://panel.yourdomain.com`
-- `PTERODACTYL_API_KEY` should be a key with permission to list servers.
-- Starting via `/startmcserver` uses `/api/client/servers/{identifier}/power` and often requires a `ptlc_` key.
-
-## 4) Install And Run
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+git clone https://github.com/schekuri4/Discord_Bot-Azure-pteradactyl.git
+cd Discord_Bot-Azure-pteradactyl
+python3 -m venv .venv
+source .venv/bin/activate   # Linux/Mac
+# .\.venv\Scripts\Activate.ps1  # Windows
 pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your values
 python bot.py
 ```
 
-## 5) Discord Slash Commands
+## Commands
 
-Once the bot is online, use in your server:
+| Command          | Description                                              |
+| ---------------- | -------------------------------------------------------- |
+| `/startserver`   | Start Azure VM                                           |
+| `/stopserver`    | Stop Azure VM                                            |
+| `/statusserver`  | Check Azure VM status                                    |
+| `/mc`            | Server panel — dropdown to pick a server, start/stop/refresh buttons |
 
-- `/statusserver`
-- `/startserver`
-- `/stopserver`
-- `/mcservers`
-- `/startmcserver`
+## Environment Variables
+
+See `.env.example` for all required values.
 
 ## Security Notes
 
