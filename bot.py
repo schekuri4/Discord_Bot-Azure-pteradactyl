@@ -36,7 +36,8 @@ PTERODACTYL_API_KEY = os.getenv("PTERODACTYL_API_KEY")
 SERVER_CACHE_FILE = Path(__file__).parent / "server_cache.json"
 
 # Active timed session state
-active_session: dict[str, Any] | None = None  # {task, end_time, channel_id, user_id}
+# Keys: task, duration, channel_id, user_id, console_channel_id, server_identifier, guild_id
+active_session: dict[str, Any] | None = None
 
 credential = ClientSecretCredential(
     tenant_id=AZURE_TENANT_ID,
@@ -46,6 +47,7 @@ credential = ClientSecretCredential(
 compute_client = ComputeManagementClient(credential, AZURE_SUBSCRIPTION_ID)
 
 intents = discord.Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -153,6 +155,20 @@ class PterodactylApi:
                     )
                 raise PterodactylApiError(
                     f"Pterodactyl power signal failed ({response.status}): {body[:300]}"
+                )
+
+    async def send_command(self, identifier: str, command: str) -> None:
+        url = f"{self.panel_url}/api/client/servers/{identifier}/command"
+        payload = {"command": command}
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=self._headers(), json=payload, timeout=timeout) as response:
+                if response.status in (200, 202, 204):
+                    return
+                body = await response.text()
+                raise PterodactylApiError(
+                    f"Console command failed ({response.status}): {body[:300]}"
                 )
 
 
@@ -264,13 +280,66 @@ async def _session_timer(duration_minutes: int, channel_id: int, user_id: int) -
             await channel.send(
                 f"<@{user_id}> \u23f0 Session expired. Shutting down the Azure VM..."
             )
+        await _cleanup_console_channel()
         await _shutdown_vm()
         active_session = None
         if channel and isinstance(channel, discord.abc.Messageable):
             await channel.send(f"<@{user_id}> \u2705 Azure VM has been deallocated.")
 
 
-def _start_session(duration_minutes: int, channel_id: int, user_id: int) -> None:
+async def _create_console_channel(
+    guild: discord.Guild, server_name: str, server_identifier: str,
+) -> discord.TextChannel | None:
+    """Create an admin-only text channel for server console I/O."""
+    # Sanitize name for Discord channel (lowercase, hyphens, max 100)
+    channel_name = f"console-{server_name.lower().replace(' ', '-')[:80]}"
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    # Grant access to every role that has administrator
+    for role in guild.roles:
+        if role.permissions.administrator:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    channel = await guild.create_text_channel(
+        name=channel_name,
+        overwrites=overwrites,
+        topic=f"Console for {server_name} ({server_identifier}). Type here to send commands.",
+    )
+    await channel.send(
+        f"\U0001f5a5\ufe0f **Console channel for {server_name}**\n"
+        "Everything you type here will be sent as a command to the game server.\n"
+        "This channel will be deleted when the session ends."
+    )
+    return channel
+
+
+async def _cleanup_console_channel() -> None:
+    """Delete the console channel if it exists."""
+    global active_session
+    if not active_session:
+        return
+    ch_id = active_session.get("console_channel_id")
+    if ch_id:
+        ch = client.get_channel(ch_id)
+        if ch:
+            try:
+                await ch.delete(reason="Server session ended.")
+            except Exception:
+                pass
+        active_session["console_channel_id"] = None
+
+
+def _start_session(
+    duration_minutes: int,
+    channel_id: int,
+    user_id: int,
+    guild_id: int | None = None,
+    server_identifier: str | None = None,
+    console_channel_id: int | None = None,
+) -> None:
     global active_session
     # Cancel any existing session
     if active_session and active_session.get("task"):
@@ -283,6 +352,9 @@ def _start_session(duration_minutes: int, channel_id: int, user_id: int) -> None
         "duration": duration_minutes,
         "channel_id": channel_id,
         "user_id": user_id,
+        "guild_id": guild_id,
+        "server_identifier": server_identifier,
+        "console_channel_id": console_channel_id,
     }
 
 
@@ -462,10 +534,31 @@ class ServerStartDurationView(discord.ui.View):
             resources = {}
         state = str(resources.get("current_state", "unknown"))
 
+        # Create console channel
+        console_ch: discord.TextChannel | None = None
+        if interaction.guild:
+            try:
+                console_ch = await _create_console_channel(
+                    interaction.guild, self.server_name, self.server_identifier,
+                )
+            except Exception:
+                pass
+
+        # Update session with console channel + server info
+        if active_session:
+            active_session["server_identifier"] = self.server_identifier
+            active_session["guild_id"] = interaction.guild_id
+            if console_ch:
+                active_session["console_channel_id"] = console_ch.id
+
+        console_note = ""
+        if console_ch:
+            console_note = f"\n\n\U0001f5a5\ufe0f Console channel: {console_ch.mention}"
+
         await interaction.edit_original_response(
             embed=discord.Embed(
                 title=f"\u2705  {self.server_name} — {state}",
-                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.",
+                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.{console_note}",
                 color=STATUS_COLORS.get(state, discord.Color.green()),
             ),
         )
@@ -501,9 +594,11 @@ async def stopserver(interaction: discord.Interaction) -> None:
         return
 
     await interaction.response.defer(thinking=True)
-    # Cancel active session timer if any
-    if active_session and active_session.get("task"):
-        active_session["task"].cancel()
+    # Cancel active session timer and clean up console channel
+    if active_session:
+        if active_session.get("task"):
+            active_session["task"].cancel()
+        await _cleanup_console_channel()
         active_session = None
 
     compute_client.virtual_machines.begin_deallocate(
@@ -749,6 +844,31 @@ async def mc(interaction: discord.Interaction) -> None:
 async def on_ready() -> None:
     await tree.sync()
     print(f"Logged in as {client.user} and synced slash commands.")
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    # Ignore bot's own messages
+    if message.author == client.user or message.author.bot:
+        return
+
+    # Check if this message is in the active console channel
+    if (
+        active_session
+        and active_session.get("console_channel_id")
+        and message.channel.id == active_session["console_channel_id"]
+        and active_session.get("server_identifier")
+    ):
+        cmd_text = message.content.strip()
+        if not cmd_text:
+            return
+        try:
+            await _ptero_client().send_command(
+                active_session["server_identifier"], cmd_text
+            )
+            await message.add_reaction("\u2705")
+        except Exception as exc:
+            await message.reply(f"\u274c Could not send command: {exc}", delete_after=10)
 
 
 @client.event
