@@ -1031,6 +1031,53 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
             resources = {}
 
         state = str(resources.get("current_state", "unknown"))
+
+        # After stop/kill: check if any server is still running — if not, shut down Azure VM
+        if self.signal in ("stop", "kill") and active_session:
+            try:
+                all_srv = await _ptero_client().list_servers()
+                any_running = False
+                for s in all_srv:
+                    try:
+                        res = await _ptero_client().get_server_resources(s["identifier"])
+                        s_state = str(res.get("current_state", "offline"))
+                    except Exception:
+                        s_state = "offline"
+                    if s_state in ("running", "starting"):
+                        any_running = True
+                        break
+
+                if not any_running:
+                    # No servers running — auto-shutdown Azure VM
+                    embed = _server_embed(server, state)
+                    embed.add_field(
+                        name="\U0001f6d1 Auto-shutdown",
+                        value="No game servers are running. Deallocating Azure VM...",
+                        inline=False,
+                    )
+                    await interaction.edit_original_response(embed=embed, view=None)
+
+                    if active_session.get("task"):
+                        active_session["task"].cancel()
+                    await _cleanup_console_channel()
+                    await _shutdown_vm()
+                    active_session = None
+
+                    embed = _server_embed(server, state)
+                    embed.add_field(
+                        name="\u2705 VM Deallocated",
+                        value="All game servers were offline — Azure VM has been shut down to save costs.",
+                        inline=False,
+                    )
+                    all_servers = self.view.all_servers if self.view else []
+                    nav = discord.ui.View(timeout=900)
+                    if all_servers:
+                        nav.add_item(BackButton(all_servers))
+                    await interaction.edit_original_response(embed=embed, view=nav if all_servers else None)
+                    return
+            except Exception:
+                pass  # If check fails, just show normal result
+
         embed = _server_embed(server, state)
         new_view = ServerActionView(server, state, self.view.all_servers if self.view else [])
         await interaction.edit_original_response(embed=embed, view=new_view)
