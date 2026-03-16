@@ -2,6 +2,13 @@
 
 Discord bot to start/stop an Azure VM and manage Pterodactyl game servers.
 
+## Features
+
+- **Timed sessions** — When starting the VM, choose a duration (30m / 1h / 2h / 4h). The bot warns you 5 minutes before expiry and auto-deallocates the VM when time is up. You can extend while the session is active.
+- **Admin-only** — All commands require Discord server Administrator permission.
+- **Pterodactyl panel** — Rich `/mc` UI with dropdown + start/stop/restart/refresh buttons.
+- **Offline cache** — Server list is saved locally so the bot works even when the Pterodactyl panel is unreachable.
+
 ## Setup
 
 ```bash
@@ -20,8 +27,8 @@ python bot.py
 
 | Command         | Description                                                          |
 | --------------- | -------------------------------------------------------------------- |
-| `/startserver`  | Start Azure VM                                                       |
-| `/stopserver`   | Stop Azure VM                                                        |
+| `/startserver`  | Start Azure VM with a timed session (choose duration)                |
+| `/stopserver`   | Stop Azure VM (cancels any active timer)                             |
 | `/statusserver` | Check Azure VM status                                                |
 | `/mc`           | Server panel — dropdown to pick a server, start/stop/refresh buttons |
 
@@ -33,4 +40,4 @@ See `.env.example` for all required values.
 
 - Keep `.env` private and never commit it.
 - Rotate secrets if they are ever exposed.
-- Optional: set `DISCORD_ADMIN_USER_ID` to restrict command use to your Discord account.
+- All commands are restricted to Discord server Administrators.

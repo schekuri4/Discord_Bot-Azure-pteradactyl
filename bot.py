@@ -1,5 +1,8 @@
+import asyncio
+import json
 import os
 import traceback
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -27,9 +30,13 @@ AZURE_CLIENT_SECRET = _require_env("AZURE_CLIENT_SECRET")
 AZURE_SUBSCRIPTION_ID = _require_env("AZURE_SUBSCRIPTION_ID")
 AZURE_RESOURCE_GROUP = _require_env("AZURE_RESOURCE_GROUP")
 AZURE_VM_NAME = _require_env("AZURE_VM_NAME")
-DISCORD_ADMIN_USER_ID = os.getenv("DISCORD_ADMIN_USER_ID")
 PTERODACTYL_PANEL_URL = os.getenv("PTERODACTYL_PANEL_URL")
 PTERODACTYL_API_KEY = os.getenv("PTERODACTYL_API_KEY")
+
+SERVER_CACHE_FILE = Path(__file__).parent / "server_cache.json"
+
+# Active timed session state
+active_session: dict[str, Any] | None = None  # {task, end_time, channel_id, user_id}
 
 credential = ClientSecretCredential(
     tenant_id=AZURE_TENANT_ID,
@@ -158,9 +165,10 @@ def _ptero_client() -> PterodactylApi:
 
 
 def _is_authorized(interaction: discord.Interaction) -> bool:
-    if not DISCORD_ADMIN_USER_ID:
-        return True
-    return str(interaction.user.id) == DISCORD_ADMIN_USER_ID
+    if interaction.guild is None:
+        return False
+    perms = interaction.user.guild_permissions  # type: ignore[union-attr]
+    return perms.administrator
 
 
 def _vm_power_state() -> str:
@@ -188,6 +196,170 @@ async def _check_auth(interaction: discord.Interaction) -> bool:
     return False
 
 
+# ── Local server cache ───────────────────────────────────────────────
+
+def _save_server_cache(servers: list[dict[str, Any]]) -> None:
+    SERVER_CACHE_FILE.write_text(json.dumps(servers, indent=2), encoding="utf-8")
+
+
+def _load_server_cache() -> list[dict[str, Any]] | None:
+    if SERVER_CACHE_FILE.exists():
+        try:
+            data = json.loads(SERVER_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+async def _fetch_servers_with_cache() -> tuple[list[dict[str, Any]], bool]:
+    """Return (servers, from_cache). Tries API first, falls back to cache."""
+    try:
+        servers = await _ptero_client().list_servers()
+        _save_server_cache(servers)
+        return servers, False
+    except Exception:
+        cached = _load_server_cache()
+        if cached:
+            return cached, True
+        raise
+
+
+# ── Timed session helpers ────────────────────────────────────────────
+
+async def _shutdown_vm() -> str:
+    """Deallocate the Azure VM and return new state."""
+    compute_client.virtual_machines.begin_deallocate(
+        AZURE_RESOURCE_GROUP, AZURE_VM_NAME
+    ).result()
+    return _vm_power_state()
+
+
+async def _session_timer(duration_minutes: int, channel_id: int, user_id: int) -> None:
+    """Background task that warns before expiry and auto-shuts down the VM."""
+    global active_session
+    warn_at = max(duration_minutes - 5, 0)  # warn 5 min before end
+
+    # Sleep until warning time
+    if warn_at > 0:
+        await asyncio.sleep(warn_at * 60)
+
+    channel = client.get_channel(channel_id)
+    remaining = duration_minutes - warn_at
+    if channel and isinstance(channel, discord.abc.Messageable):
+        view = ExtendSessionView(user_id)
+        await channel.send(
+            f"<@{user_id}> \u26a0\ufe0f Your server session ends in **{remaining} minute(s)**! "
+            "Press **Extend** below to add more time, or the VM will shut down automatically.",
+            view=view,
+        )
+
+    # Sleep the remaining time
+    await asyncio.sleep(remaining * 60)
+
+    # Check if session was extended (task would have been replaced)
+    if active_session and active_session.get("task") is asyncio.current_task():
+        if channel and isinstance(channel, discord.abc.Messageable):
+            await channel.send(
+                f"<@{user_id}> \u23f0 Session expired. Shutting down the Azure VM..."
+            )
+        await _shutdown_vm()
+        active_session = None
+        if channel and isinstance(channel, discord.abc.Messageable):
+            await channel.send(f"<@{user_id}> \u2705 Azure VM has been deallocated.")
+
+
+def _start_session(duration_minutes: int, channel_id: int, user_id: int) -> None:
+    global active_session
+    # Cancel any existing session
+    if active_session and active_session.get("task"):
+        active_session["task"].cancel()
+
+    loop = asyncio.get_event_loop()
+    task = loop.create_task(_session_timer(duration_minutes, channel_id, user_id))
+    active_session = {
+        "task": task,
+        "duration": duration_minutes,
+        "channel_id": channel_id,
+        "user_id": user_id,
+    }
+
+
+class ExtendSessionView(discord.ui.View):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    @discord.ui.select(
+        cls=discord.ui.Select,
+        placeholder="Extend session by...",
+        options=[
+            discord.SelectOption(label="30 minutes", value="30"),
+            discord.SelectOption(label="1 hour", value="60"),
+            discord.SelectOption(label="2 hours", value="120"),
+        ],
+        row=0,
+    )
+    async def extend_select(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the session owner can extend.", ephemeral=True)
+            return
+        extra = int(select.values[0])
+        _start_session(extra, interaction.channel_id or 0, self.user_id)
+        await interaction.response.send_message(
+            f"\u2705 Session extended by **{extra} minutes**. New timer started.",
+            ephemeral=False,
+        )
+        self.stop()
+
+
+class DurationSelect(discord.ui.View):
+    """Shown when user starts the VM via /mc → lets them pick session duration."""
+    def __init__(self, user_id: int, channel_id: int) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.channel_id = channel_id
+
+    @discord.ui.select(
+        cls=discord.ui.Select,
+        placeholder="How long do you need the server?",
+        options=[
+            discord.SelectOption(label="30 minutes", value="30"),
+            discord.SelectOption(label="1 hour", value="60"),
+            discord.SelectOption(label="2 hours", value="120"),
+            discord.SelectOption(label="4 hours", value="240"),
+        ],
+        row=0,
+    )
+    async def duration_callback(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
+            return
+
+        duration = int(select.values[0])
+        await interaction.response.defer(ephemeral=True)
+
+        # Start the Azure VM
+        await interaction.edit_original_response(
+            content=f"\u23f3 Starting Azure VM for **{duration} minutes**...",
+            view=None,
+        )
+        compute_client.virtual_machines.begin_start(
+            AZURE_RESOURCE_GROUP, AZURE_VM_NAME
+        ).result()
+
+        _start_session(duration, self.channel_id, self.user_id)
+
+        hours, mins = divmod(duration, 60)
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+        await interaction.edit_original_response(
+            content=f"\u2705 Azure VM started! Session length: **{time_str}**. "
+            "You will be warned 5 minutes before auto-shutdown.",
+            view=None,
+        )
+
+
 @tree.command(name="statusserver", description="Show Azure VM power status")
 async def statusserver(interaction: discord.Interaction) -> None:
     if not await _check_auth(interaction):
@@ -198,26 +370,31 @@ async def statusserver(interaction: discord.Interaction) -> None:
     await interaction.followup.send(f"`{AZURE_VM_NAME}` status: `{state}`")
 
 
-@tree.command(name="startserver", description="Start the Azure VM")
+@tree.command(name="startserver", description="Start the Azure VM with a timed session")
 async def startserver(interaction: discord.Interaction) -> None:
     if not await _check_auth(interaction):
         return
 
-    await interaction.response.defer(thinking=True)
-    compute_client.virtual_machines.begin_start(
-        AZURE_RESOURCE_GROUP,
-        AZURE_VM_NAME,
-    ).result()
-    state = _vm_power_state()
-    await interaction.followup.send(f"Started `{AZURE_VM_NAME}`. Current status: `{state}`")
+    view = DurationSelect(interaction.user.id, interaction.channel_id or 0)
+    await interaction.response.send_message(
+        "\u23f1\ufe0f Choose how long you need the Azure VM:",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @tree.command(name="stopserver", description="Stop (deallocate) the Azure VM")
 async def stopserver(interaction: discord.Interaction) -> None:
+    global active_session
     if not await _check_auth(interaction):
         return
 
     await interaction.response.defer(thinking=True)
+    # Cancel active session timer if any
+    if active_session and active_session.get("task"):
+        active_session["task"].cancel()
+        active_session = None
+
     compute_client.virtual_machines.begin_deallocate(
         AZURE_RESOURCE_GROUP,
         AZURE_VM_NAME,
@@ -399,7 +576,7 @@ async def mc(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     try:
-        servers = await _ptero_client().list_servers()
+        servers, from_cache = await _fetch_servers_with_cache()
     except Exception as exc:
         await interaction.followup.send(f"Could not fetch servers: {exc}", ephemeral=True)
         return
@@ -408,9 +585,13 @@ async def mc(interaction: discord.Interaction) -> None:
         await interaction.followup.send("No servers found on the panel.", ephemeral=True)
         return
 
+    desc = "Select a server from the dropdown below to view details and controls."
+    if from_cache:
+        desc += "\n\u26a0\ufe0f *Panel unreachable — showing cached server list.*"
+
     embed = discord.Embed(
         title="\U0001f3ae  Minecraft Server Panel",
-        description="Select a server from the dropdown below to view details and controls.",
+        description=desc,
         color=discord.Color.dark_green(),
     )
     for s in servers[:10]:

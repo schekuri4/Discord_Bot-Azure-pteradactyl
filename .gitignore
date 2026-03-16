@@ -3,3 +3,4 @@
 __pycache__/
 *.pyc
 .vscode/
+server_cache.json
