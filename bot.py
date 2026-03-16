@@ -70,7 +70,7 @@ class PterodactylApi:
         # Client API lists servers with allocation (IP/port) and status info.
         url = f"{self.panel_url}/api/client?per_page=100"
         servers: list[dict[str, Any]] = []
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=10)
 
         async with aiohttp.ClientSession() as session:
             while url:
