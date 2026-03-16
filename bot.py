@@ -314,8 +314,29 @@ class ExtendSessionView(discord.ui.View):
         self.stop()
 
 
+async def _wait_for_panel(max_wait: int = 180, interval: int = 10) -> bool:
+    """Poll the Pterodactyl panel until it responds or max_wait seconds pass."""
+    elapsed = 0
+    while elapsed < max_wait:
+        try:
+            await _ptero_client().list_servers()
+            return True
+        except Exception:
+            await asyncio.sleep(interval)
+            elapsed += interval
+    return False
+
+
+DURATION_OPTIONS = [
+    discord.SelectOption(label="30 minutes", value="30"),
+    discord.SelectOption(label="1 hour", value="60"),
+    discord.SelectOption(label="2 hours", value="120"),
+    discord.SelectOption(label="4 hours", value="240"),
+]
+
+
 class DurationSelect(discord.ui.View):
-    """Shown when user starts the VM via /mc → lets them pick session duration."""
+    """Shown when user starts the VM via /startserver."""
     def __init__(self, user_id: int, channel_id: int) -> None:
         super().__init__(timeout=60)
         self.user_id = user_id
@@ -324,12 +345,7 @@ class DurationSelect(discord.ui.View):
     @discord.ui.select(
         cls=discord.ui.Select,
         placeholder="How long do you need the server?",
-        options=[
-            discord.SelectOption(label="30 minutes", value="30"),
-            discord.SelectOption(label="1 hour", value="60"),
-            discord.SelectOption(label="2 hours", value="120"),
-            discord.SelectOption(label="4 hours", value="240"),
-        ],
+        options=DURATION_OPTIONS,
         row=0,
     )
     async def duration_callback(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
@@ -340,7 +356,6 @@ class DurationSelect(discord.ui.View):
         duration = int(select.values[0])
         await interaction.response.defer(ephemeral=True)
 
-        # Start the Azure VM
         await interaction.edit_original_response(
             content=f"\u23f3 Starting Azure VM for **{duration} minutes**...",
             view=None,
@@ -357,6 +372,102 @@ class DurationSelect(discord.ui.View):
             content=f"\u2705 Azure VM started! Session length: **{time_str}**. "
             "You will be warned 5 minutes before auto-shutdown.",
             view=None,
+        )
+
+
+class ServerStartDurationView(discord.ui.View):
+    """Duration picker shown when starting a game server from /mc.
+    Starts Azure VM → waits for panel → starts the Pterodactyl server."""
+    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.channel_id = channel_id
+        self.server_identifier = server_identifier
+        self.server_name = server_name
+
+    @discord.ui.select(
+        cls=discord.ui.Select,
+        placeholder="How long do you need the server?",
+        options=DURATION_OPTIONS,
+        row=0,
+    )
+    async def duration_callback(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
+            return
+
+        duration = int(select.values[0])
+        hours, mins = divmod(duration, 60)
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+
+        # Step 1 — Start Azure VM
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"\u23f3  Starting Azure VM ({time_str})...",
+                description="Booting the underlying VM. This may take a minute.",
+                color=discord.Color.gold(),
+            ),
+            view=None,
+        )
+        compute_client.virtual_machines.begin_start(
+            AZURE_RESOURCE_GROUP, AZURE_VM_NAME
+        ).result()
+
+        _start_session(duration, self.channel_id, self.user_id)
+
+        # Step 2 — Wait for Pterodactyl panel
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title="\u23f3  Waiting for game panel to come online...",
+                description="Azure VM is up. Waiting for the Pterodactyl panel to respond.",
+                color=discord.Color.gold(),
+            ),
+        )
+        panel_up = await _wait_for_panel()
+        if not panel_up:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="\u26a0\ufe0f  Panel did not respond",
+                    description=f"Azure VM is running (session: **{time_str}**) but the panel didn't come up. "
+                    "Try `/mc` again in a moment.",
+                    color=discord.Color.orange(),
+                ),
+            )
+            return
+
+        # Step 3 — Start the game server
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title=f"\u23f3  Starting {self.server_name}...",
+                description="Panel is up. Sending start signal to the game server.",
+                color=discord.Color.gold(),
+            ),
+        )
+        try:
+            await _ptero_client().send_power_signal(self.server_identifier, "start")
+        except Exception as exc:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="\u274c  Could not start game server",
+                    description=str(exc),
+                    color=discord.Color.red(),
+                ),
+            )
+            return
+
+        await asyncio.sleep(3)
+        try:
+            resources = await _ptero_client().get_server_resources(self.server_identifier)
+        except Exception:
+            resources = {}
+        state = str(resources.get("current_state", "unknown"))
+
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title=f"\u2705  {self.server_name} — {state}",
+                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.",
+                color=STATUS_COLORS.get(state, discord.Color.green()),
+            ),
         )
 
 
@@ -511,6 +622,26 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
             return
 
         server = self.view.server if self.view else {}
+
+        # If starting and there's no active session, show the duration picker
+        # which will boot the Azure VM → wait for panel → start game server
+        if self.signal == "start" and not active_session:
+            view = ServerStartDurationView(
+                interaction.user.id,
+                interaction.channel_id or 0,
+                self.identifier,
+                server.get("name", "server"),
+            )
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="\u23f1\ufe0f  Choose session duration",
+                    description="The Azure VM will start, then the game server will boot automatically.",
+                    color=discord.Color.blurple(),
+                ),
+                view=view,
+            )
+            return
+
         signal_labels = {"start": "Starting", "stop": "Stopping", "restart": "Restarting", "kill": "Killing"}
         action_label = signal_labels.get(self.signal, self.signal.title())
 
