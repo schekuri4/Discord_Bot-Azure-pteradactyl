@@ -10,6 +10,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+from mcstatus import JavaServer
 from azure.identity import ClientSecretCredential
 from azure.mgmt.compute import ComputeManagementClient
 
@@ -425,6 +426,30 @@ DURATION_OPTIONS = [
     discord.SelectOption(label="2 hours", value="120"),
     discord.SelectOption(label="4 hours", value="240"),
 ]
+
+
+async def _enrich_servers(servers: list[dict[str, Any]]) -> None:
+    """Fetch Pterodactyl state and Minecraft query info for each server in parallel."""
+    ptero = _ptero_client()
+
+    async def _enrich_one(s: dict[str, Any]) -> None:
+        try:
+            resources = await ptero.get_server_resources(s["identifier"])
+            s["state"] = str(resources.get("current_state", "unknown"))
+        except Exception:
+            s["state"] = "unknown"
+
+        if s["state"] == "running" and s.get("ip") and s.get("port"):
+            try:
+                srv = JavaServer.lookup(f"{s['ip']}:{s['port']}")
+                status = await srv.async_status()
+                s["players_online"] = status.players.online
+                s["players_max"] = status.players.max
+                s["mc_version"] = status.version.name
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_enrich_one(s) for s in servers))
 
 
 class DurationSelect(discord.ui.View):
@@ -960,6 +985,11 @@ class BackButton(discord.ui.Button["ServerActionView"]):
         if not _is_authorized(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
+        # Re-enrich servers for fresh status
+        try:
+            await _enrich_servers(self.servers)
+        except Exception:
+            pass
         embed = _mc_list_embed(self.servers)
         view = McView(self.servers)
         await interaction.response.edit_message(embed=embed, view=view)
@@ -991,9 +1021,21 @@ def _mc_list_embed(servers: list[dict[str, Any]], from_cache: bool = False) -> d
 
     lines: list[str] = []
     for i, s in enumerate(servers[:10], 1):
+        state = s.get("state", "unknown")
+        emoji = STATUS_EMOJI.get(state, "\u26ab")
         address = f"{s['ip']}:{s['port']}" if s.get("ip") and s.get("port") else "\u2014"
-        lines.append(f"`{i}.` **{s['name']}** \u2014 `{address}`")
-    embed.add_field(name="Servers", value="\n".join(lines), inline=False)
+
+        parts = [f"`{i}.` {emoji} **{s['name']}**"]
+        if state == "running":
+            players = f"{s.get('players_online', '?')}/{s.get('players_max', '?')}"
+            parts.append(f"\U0001f465 {players}")
+            if s.get("mc_version"):
+                parts.append(f"v{s['mc_version']}")
+        else:
+            parts.append("Offline")
+        parts.append(f"`{address}`")
+        lines.append(" \u2014 ".join(parts))
+    embed.add_field(name="Servers", value="\n".join(lines) or "No servers", inline=False)
 
     embed.timestamp = discord.utils.utcnow()
     return embed
@@ -1020,6 +1062,13 @@ async def mc(interaction: discord.Interaction) -> None:
     if not active_session and not from_cache:
         _start_session(15, interaction.channel_id or 0, interaction.user.id,
                         guild_id=interaction.guild_id)
+
+    # Enrich servers with status, player count, and version
+    if not from_cache:
+        try:
+            await _enrich_servers(servers)
+        except Exception:
+            pass
 
     embed = _mc_list_embed(servers, from_cache)
     view = McView(servers)
