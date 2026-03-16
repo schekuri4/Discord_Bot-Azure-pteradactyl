@@ -580,6 +580,92 @@ class ServerStartDurationView(discord.ui.View):
         )
 
 
+class QuickStartDurationView(discord.ui.View):
+    """Duration picker when VM is already running. Starts game server and resets timer."""
+    def __init__(self, user_id: int, channel_id: int, server_identifier: str, server_name: str) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.channel_id = channel_id
+        self.server_identifier = server_identifier
+        self.server_name = server_name
+
+    @discord.ui.select(
+        cls=discord.ui.Select,
+        placeholder="How long do you need the server?",
+        options=DURATION_OPTIONS,
+        row=0,
+    )
+    async def duration_callback(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:  # type: ignore[type-arg]
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who triggered this can choose.", ephemeral=True)
+            return
+
+        duration = int(select.values[0])
+        hours, mins = divmod(duration, 60)
+        time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"\u23f3  Starting {self.server_name}...",
+                description="Sending start signal to the game server.",
+                color=discord.Color.gold(),
+            ),
+            view=None,
+        )
+
+        # Reset timer
+        _start_session(duration, self.channel_id, self.user_id,
+                        guild_id=interaction.guild_id,
+                        server_identifier=self.server_identifier)
+
+        try:
+            await _ptero_client().send_power_signal(self.server_identifier, "start")
+        except Exception as exc:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="\u274c  Could not start game server",
+                    description=str(exc),
+                    color=discord.Color.red(),
+                ),
+            )
+            return
+
+        await asyncio.sleep(3)
+        try:
+            resources = await _ptero_client().get_server_resources(self.server_identifier)
+        except Exception:
+            resources = {}
+        state = str(resources.get("current_state", "unknown"))
+
+        # Create console channel
+        console_ch: discord.TextChannel | None = None
+        if interaction.guild:
+            try:
+                console_ch = await _create_console_channel(
+                    interaction.guild, self.server_name, self.server_identifier,
+                )
+            except Exception:
+                pass
+
+        if active_session:
+            active_session["server_identifier"] = self.server_identifier
+            active_session["guild_id"] = interaction.guild_id
+            if console_ch:
+                active_session["console_channel_id"] = console_ch.id
+
+        console_note = ""
+        if console_ch:
+            console_note = f"\n\n\U0001f5a5\ufe0f Console channel: {console_ch.mention}"
+
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title=f"\u2705  {self.server_name} \u2014 {state}",
+                description=f"Session: **{time_str}**. You'll be warned 5 min before auto-shutdown.{console_note}",
+                color=STATUS_COLORS.get(state, discord.Color.green()),
+            ),
+        )
+
+
 @tree.command(name="statusserver", description="Show Azure VM power status")
 async def statusserver(interaction: discord.Interaction) -> None:
     if not await _check_auth(interaction):
@@ -743,23 +829,40 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
 
         server = self.view.server if self.view else {}
 
-        # If starting and there's no active session, show the duration picker
-        # which will boot the Azure VM → wait for panel → start game server
-        if self.signal == "start" and not active_session:
-            view = ServerStartDurationView(
-                interaction.user.id,
-                interaction.channel_id or 0,
-                self.identifier,
-                server.get("name", "server"),
-            )
-            await interaction.response.edit_message(
-                embed=discord.Embed(
-                    title="\u23f1\ufe0f  Choose session duration",
-                    description="The Azure VM will start, then the game server will boot automatically.",
-                    color=discord.Color.blurple(),
-                ),
-                view=view,
-            )
+        # Always show duration picker when starting a server
+        if self.signal == "start":
+            if active_session:
+                # VM already running — just pick duration, start server, reset timer
+                view = QuickStartDurationView(
+                    interaction.user.id,
+                    interaction.channel_id or 0,
+                    self.identifier,
+                    server.get("name", "server"),
+                )
+                await interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title="\u23f1\ufe0f  Choose session duration",
+                        description="The VM is already running. Pick how long you need the server.",
+                        color=discord.Color.blurple(),
+                    ),
+                    view=view,
+                )
+            else:
+                # VM is off — boot VM → wait for panel → start server
+                view = ServerStartDurationView(
+                    interaction.user.id,
+                    interaction.channel_id or 0,
+                    self.identifier,
+                    server.get("name", "server"),
+                )
+                await interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title="\u23f1\ufe0f  Choose session duration",
+                        description="The Azure VM will start, then the game server will boot automatically.",
+                        color=discord.Color.blurple(),
+                    ),
+                    view=view,
+                )
             return
 
         signal_labels = {"start": "Starting", "stop": "Stopping", "restart": "Restarting", "kill": "Killing"}
