@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -355,6 +356,7 @@ def _start_session(
         "guild_id": guild_id,
         "server_identifier": server_identifier,
         "console_channel_id": console_channel_id,
+        "started_at": time.time(),
     }
 
 
@@ -384,6 +386,20 @@ class ExtendSessionView(discord.ui.View):
             ephemeral=False,
         )
         self.stop()
+
+
+def _session_remaining_str() -> str:
+    """Return human-readable remaining time for the active session."""
+    if not active_session or "started_at" not in active_session:
+        return "No active session"
+    elapsed = time.time() - active_session["started_at"]
+    total = active_session["duration"] * 60
+    remaining = max(total - elapsed, 0)
+    mins = int(remaining // 60)
+    if mins >= 60:
+        h, m = divmod(mins, 60)
+        return f"{h}h {m}m remaining"
+    return f"{mins}m remaining"
 
 
 async def _wait_for_panel(max_wait: int = 180, interval: int = 10) -> bool:
@@ -632,8 +648,13 @@ def _server_embed(server: dict[str, Any], state: str) -> discord.Embed:
         title=f"{emoji}  {server['name']}",
         color=color,
     )
+    desc_parts = []
+    if active_session:
+        desc_parts.append(f"\u23f1\ufe0f **{_session_remaining_str()}**")
     if server.get("description"):
-        embed.description = server["description"]
+        desc_parts.append(server["description"])
+    if desc_parts:
+        embed.description = "\n".join(desc_parts)
 
     address = ""
     if server.get("ip") and server.get("port"):
@@ -663,6 +684,7 @@ class ServerSelect(discord.ui.Select["McView"]):
         ]
         super().__init__(placeholder="Select a server...", options=options, row=0)
         self.servers = {s["identifier"]: s for s in servers}
+        self.servers_list = servers
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not _is_authorized(interaction):
@@ -684,15 +706,16 @@ class ServerSelect(discord.ui.Select["McView"]):
 
         state = str(resources.get("current_state", "unknown"))
         embed = _server_embed(server, state)
-        view = ServerActionView(server, state)
+        view = ServerActionView(server, state, self.servers_list)
         await interaction.edit_original_response(embed=embed, view=view)
 
 
 class ServerActionView(discord.ui.View):
-    def __init__(self, server: dict[str, Any], state: str) -> None:
+    def __init__(self, server: dict[str, Any], state: str, all_servers: list[dict[str, Any]] | None = None) -> None:
         super().__init__(timeout=120)
         self.server = server
         self.identifier = server["identifier"]
+        self.all_servers = all_servers or []
 
         if state in ("offline", "unknown"):
             self.add_item(PowerButton(self.identifier, "start", discord.ButtonStyle.green, "\u25B6 Start"))
@@ -703,6 +726,8 @@ class ServerActionView(discord.ui.View):
             self.add_item(PowerButton(self.identifier, "kill", discord.ButtonStyle.danger, "\u26A0 Kill"))
 
         self.add_item(RefreshButton(self.server))
+        if self.all_servers:
+            self.add_item(BackButton(self.all_servers))
 
 
 class PowerButton(discord.ui.Button["ServerActionView"]):
@@ -770,7 +795,7 @@ class PowerButton(discord.ui.Button["ServerActionView"]):
 
         state = str(resources.get("current_state", "unknown"))
         embed = _server_embed(server, state)
-        new_view = ServerActionView(server, state)
+        new_view = ServerActionView(server, state, self.view.all_servers if self.view else [])
         await interaction.edit_original_response(embed=embed, view=new_view)
 
 
@@ -793,14 +818,55 @@ class RefreshButton(discord.ui.Button["ServerActionView"]):
 
         state = str(resources.get("current_state", "unknown"))
         embed = _server_embed(self.server, state)
-        new_view = ServerActionView(self.server, state)
+        new_view = ServerActionView(self.server, state, self.view.all_servers if self.view else [])
         await interaction.edit_original_response(embed=embed, view=new_view)
+
+
+class BackButton(discord.ui.Button["ServerActionView"]):
+    def __init__(self, servers: list[dict[str, Any]]) -> None:
+        super().__init__(style=discord.ButtonStyle.secondary, label="\u25c0 Back", row=2)
+        self.servers = servers
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        embed = _mc_list_embed(self.servers)
+        view = McView(self.servers)
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class McView(discord.ui.View):
     def __init__(self, servers: list[dict[str, Any]]) -> None:
         super().__init__(timeout=180)
         self.add_item(ServerSelect(servers))
+
+
+def _mc_list_embed(servers: list[dict[str, Any]], from_cache: bool = False) -> discord.Embed:
+    """Build the main /mc server list embed with session timer."""
+    desc = "Select a server from the dropdown below to view details and controls."
+    if from_cache:
+        desc += "\n\u26a0\ufe0f *Panel unreachable \u2014 showing cached server list.*"
+
+    embed = discord.Embed(
+        title="\U0001f3ae  Minecraft Server Panel",
+        description=desc,
+        color=discord.Color.dark_green(),
+    )
+
+    if active_session:
+        timer_str = _session_remaining_str()
+        embed.add_field(name="\u23f1\ufe0f Session", value=f"**{timer_str}**", inline=False)
+    else:
+        embed.add_field(name="\u23f1\ufe0f Session", value="No active session", inline=False)
+
+    lines: list[str] = []
+    for i, s in enumerate(servers[:10], 1):
+        address = f"{s['ip']}:{s['port']}" if s.get("ip") and s.get("port") else "\u2014"
+        lines.append(f"`{i}.` **{s['name']}** \u2014 `{address}`")
+    embed.add_field(name="Servers", value="\n".join(lines), inline=False)
+
+    return embed
 
 
 @tree.command(name="mc", description="Manage your Minecraft servers")
@@ -820,22 +886,12 @@ async def mc(interaction: discord.Interaction) -> None:
         await interaction.followup.send("No servers found on the panel.", ephemeral=True)
         return
 
-    desc = "Select a server from the dropdown below to view details and controls."
-    if from_cache:
-        desc += "\n\u26a0\ufe0f *Panel unreachable — showing cached server list.*"
+    # Auto-start a 15-minute session if VM is reachable but no timer is set
+    if not active_session and not from_cache:
+        _start_session(15, interaction.channel_id or 0, interaction.user.id,
+                        guild_id=interaction.guild_id)
 
-    embed = discord.Embed(
-        title="\U0001f3ae  Minecraft Server Panel",
-        description=desc,
-        color=discord.Color.dark_green(),
-    )
-    # Clean list format
-    lines: list[str] = []
-    for i, s in enumerate(servers[:10], 1):
-        address = f"{s['ip']}:{s['port']}" if s.get("ip") and s.get("port") else "—"
-        lines.append(f"`{i}.` **{s['name']}** — `{address}`")
-    embed.add_field(name="Servers", value="\n".join(lines), inline=False)
-
+    embed = _mc_list_embed(servers, from_cache)
     view = McView(servers)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
